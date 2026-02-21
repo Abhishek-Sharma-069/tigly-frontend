@@ -1,15 +1,40 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { useEffect } from 'react'
 import Landing from './component/Landing'
-import Room from './Room'
+import Room from './page/Room'
+import socket from './config/socket'
 
 function App() {
+  // Global socket listeners for connection status and optional debug logs
+  useEffect(() => {
+    socket.on("connect", () => {
+      console.log("Connected to server");
+    });
+
+    socket.on("server_status", (msg) => {
+      console.log("Server:", msg);
+    });
+    socket.on("new-room", ({ type, roomId }) => {
+      console.log("New room:", type, roomId);
+    });
+    socket.on("receive-offer", ({ roomId }) => {
+      console.log("Receive offer:", roomId);
+      socket.emit("answer", { roomId, sdp: "answer" });
+    });
+    socket.on("send-offer", ({ roomId }) => {
+      console.log("Send offer:", roomId);
+      socket.emit("offer", { roomId, sdp: "offer" });
+    });
+  }, []);
 
   return (
     <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<Landing />} />
-        <Route path="/room" element={<Room />} />
-      </Routes>
+      <div className="min-h-screen antialiased">
+        <Routes>
+          <Route path="/" element={<Landing />} />
+          <Route path="/room" element={<Room />} />
+        </Routes>
+      </div>
     </BrowserRouter>
   )
 }

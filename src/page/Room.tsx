@@ -23,6 +23,8 @@ const Room = () => {
   /** Ref so cleanup can stop tracks even when state is stale */
   const localStreamRef = useRef<MediaStream | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  /** Queue ICE candidates until remote description is set */
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
 
   // Join queue on mount; listen for "new-room" when we're matched with another user
   useEffect(() => {
@@ -78,17 +80,64 @@ const Room = () => {
 
     // When the other peer's media arrives, show it in the "Stranger" video
     pc.ontrack = (event) => {
-      if (event.streams[0]) setRemoteStream(event.streams[0]);
+      const stream = event.streams?.[0] ?? (event.track ? (() => {
+        const ms = new MediaStream();
+        ms.addTrack(event.track);
+        return ms;
+      })() : null);
+      if (stream) setRemoteStream(stream);
     };
 
     // Send our camera/mic to the peer
     localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+
+    // Send ICE candidates to the other peer via server
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        const candidate = event.candidate.toJSON?.() ?? event.candidate;
+        socket.emit("ice-candidate", { roomId, candidate });
+      }
+    };
+
+    const addIceCandidate = async (candidate: RTCIceCandidateInit) => {
+      if (!pcRef.current) return;
+      try {
+        await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.error("addIceCandidate error:", e);
+      }
+    };
+
+    const flushPendingIceCandidates = async () => {
+      const pc = pcRef.current;
+      if (!pc || pendingIceRef.current.length === 0) return;
+      for (const c of pendingIceRef.current) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        } catch (e) {
+          console.error("addIceCandidate (pending) error:", e);
+        }
+      }
+      pendingIceRef.current = [];
+    };
+
+    const handleIceCandidate = async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
+      if (!candidate) return;
+      const pc = pcRef.current;
+      if (!pc) return;
+      if (pc.remoteDescription) {
+        await addIceCandidate(candidate);
+      } else {
+        pendingIceRef.current.push(candidate);
+      }
+    };
 
     // Answerer: receive offer from server → set remote desc → create answer → send answer
     const handleOffer = async ({ sdp }: { sdp: string }) => {
       if (!pcRef.current || roomType !== "receive-offer") return;
       try {
         await pcRef.current.setRemoteDescription({ type: "offer", sdp });
+        await flushPendingIceCandidates();
         const answer = await pcRef.current.createAnswer();
         await pcRef.current.setLocalDescription(answer);
         socket.emit("answer", { roomId, sdp: pcRef.current.localDescription?.sdp });
@@ -102,6 +151,7 @@ const Room = () => {
       if (!pcRef.current || roomType !== "send-offer") return;
       try {
         await pcRef.current.setRemoteDescription({ type: "answer", sdp });
+        await flushPendingIceCandidates();
       } catch (e) {
         console.error("Set remote description error:", e);
       }
@@ -109,6 +159,7 @@ const Room = () => {
 
     socket.on("offer", handleOffer);
     socket.on("answer", handleAnswer);
+    socket.on("ice-candidate", handleIceCandidate);
 
     // Offerer: create and send SDP offer to the other peer via server
     if (roomType === "send-offer") {
@@ -126,6 +177,7 @@ const Room = () => {
     return () => {
       socket.off("offer", handleOffer);
       socket.off("answer", handleAnswer);
+      socket.off("ice-candidate", handleIceCandidate);
     };
   }, [status, roomId, roomType, localStream]);
 

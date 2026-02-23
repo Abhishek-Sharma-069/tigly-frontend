@@ -15,6 +15,7 @@ const VideoCard = ({ stream, muted = false, label }: VideoCardProps) => {
   useEffect(() => {
     if (!videoRef.current || !stream) return;
     videoRef.current.srcObject = stream;
+    videoRef.current.play().catch(() => {});
     return () => {
       if (videoRef.current) videoRef.current.srcObject = null;
     };

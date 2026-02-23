@@ -17,14 +17,6 @@ function App() {
     socket.on("new-room", ({ type, roomId }) => {
       console.log("New room:", type, roomId);
     });
-    socket.on("receive-offer", ({ roomId }) => {
-      console.log("Receive offer:", roomId);
-      socket.emit("answer", { roomId, sdp: "answer" });
-    });
-    socket.on("send-offer", ({ roomId }) => {
-      console.log("Send offer:", roomId);
-      socket.emit("offer", { roomId, sdp: "offer" });
-    });
   }, []);
 
   return (

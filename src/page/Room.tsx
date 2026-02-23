@@ -26,6 +26,8 @@ const Room = () => {
 
   // Join queue on mount; listen for "new-room" when we're matched with another user
   useEffect(() => {
+    if (!name) return;
+
     socket.emit("join_room", { name });
 
     const onNewRoom = (payload: { type: string; roomId: string }) => {
@@ -138,8 +140,8 @@ const Room = () => {
           <p className="text-emerald-400">You're connected! Room: {roomId}</p>
         )}
         <div className="grid gap-4 sm:grid-cols-2">
-          {localStream && <VideoCard stream={localStream} muted={false} label="You" />}
-          {remoteStream && <VideoCard stream={remoteStream} muted={true} label="Stranger" />}
+          {localStream && <VideoCard stream={localStream} muted={true} label="You" />}
+          {remoteStream && <VideoCard stream={remoteStream} muted={false} label="Stranger" />}
         </div>
         {localStream && (
           <div className="flex justify-center">

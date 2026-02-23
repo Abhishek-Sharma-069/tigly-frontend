@@ -20,6 +20,8 @@ const Room = () => {
   // --- Media & WebRTC ---
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  /** Increment when remote stream gets a new track so VideoCard re-attaches and plays */
+  const [remoteStreamKey, setRemoteStreamKey] = useState(0);
   /** Ref so cleanup can stop tracks even when state is stale */
   const localStreamRef = useRef<MediaStream | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -29,6 +31,8 @@ const Room = () => {
   const offerSentRef = useRef(false);
   /** Answerer: offer may arrive before PC is ready; buffer it */
   const pendingOfferRef = useRef<string | null>(null);
+  /** Single remote stream we add all remote tracks to (so we don't overwrite with a single track) */
+  const remoteStreamRef = useRef<MediaStream | null>(null);
 
   // Join queue on mount; listen for "new-room" when we're matched with another user
   useEffect(() => {
@@ -103,6 +107,7 @@ const Room = () => {
       });
       pcRef.current = pc;
       setRemoteStream(null);
+      remoteStreamRef.current = null;
 
       pc.onconnectionstatechange = () => {
         console.log("[WebRTC] connectionState:", pc?.connectionState);
@@ -116,12 +121,14 @@ const Room = () => {
 
       pc.ontrack = (event) => {
         console.log("[WebRTC] ontrack:", event.track.kind);
-        const stream = event.streams?.[0] ?? (event.track ? (() => {
-          const ms = new MediaStream();
-          ms.addTrack(event.track);
-          return ms;
-        })() : null);
-        if (stream) setRemoteStream(stream);
+        const track = event.track;
+        if (!track) return;
+        if (!remoteStreamRef.current) {
+          remoteStreamRef.current = new MediaStream();
+          setRemoteStream(remoteStreamRef.current);
+        }
+        remoteStreamRef.current.addTrack(track);
+        setRemoteStreamKey((k) => k + 1);
       };
 
       localStream.getTracks().forEach((track) => pc!.addTrack(track, localStream));
@@ -249,7 +256,14 @@ const Room = () => {
         )}
         <div className="grid gap-4 sm:grid-cols-2">
           {localStream && <VideoCard stream={localStream} muted={true} label="You" />}
-          {remoteStream && <VideoCard stream={remoteStream} muted={false} label="Stranger" />}
+          {remoteStream && (
+            <VideoCard
+              key={remoteStreamKey}
+              stream={remoteStream}
+              muted={false}
+              label="Stranger"
+            />
+          )}
         </div>
         {localStream && (
           <div className="flex justify-center">

@@ -25,6 +25,10 @@ const Room = () => {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   /** Queue ICE candidates until remote description is set */
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  /** So we only send the offer once (avoids duplicate in Strict Mode) */
+  const offerSentRef = useRef(false);
+  /** Answerer: offer may arrive before PC is ready; buffer it */
+  const pendingOfferRef = useRef<string | null>(null);
 
   // Join queue on mount; listen for "new-room" when we're matched with another user
   useEffect(() => {
@@ -66,38 +70,72 @@ const Room = () => {
       setLocalStream(null);
       pcRef.current?.close();
       pcRef.current = null;
+      offerSentRef.current = false;
+      pendingOfferRef.current = null;
+      pendingIceRef.current = [];
     };
   }, []);
 
-  // When matched: create RTCPeerConnection, add local tracks, and run offer/answer signaling
+  // Answerer: listen for offer as soon as we're matched so we don't miss it if PC isn't ready yet
   useEffect(() => {
-    if (status !== "matched" || !roomId || !roomType || !localStream || pcRef.current) return;
-
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-    pcRef.current = pc;
-
-    // When the other peer's media arrives, show it in the "Stranger" video
-    pc.ontrack = (event) => {
-      const stream = event.streams?.[0] ?? (event.track ? (() => {
-        const ms = new MediaStream();
-        ms.addTrack(event.track);
-        return ms;
-      })() : null);
-      if (stream) setRemoteStream(stream);
+    if (status !== "matched" || roomType !== "receive-offer" || !roomId) return;
+    const onOffer = ({ sdp }: { sdp: string }) => {
+      pendingOfferRef.current = sdp;
     };
-
-    // Send our camera/mic to the peer
-    localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-
-    // Send ICE candidates to the other peer via server
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        const candidate = event.candidate.toJSON?.() ?? event.candidate;
-        socket.emit("ice-candidate", { roomId, candidate });
-      }
+    socket.on("offer", onOffer);
+    return () => {
+      socket.off("offer", onOffer);
     };
+  }, [status, roomType, roomId]);
+
+  // When matched: create RTCPeerConnection (once), add local tracks, and run offer/answer signaling.
+  // Handlers are re-registered every run so they survive React Strict Mode cleanup.
+  useEffect(() => {
+    if (status !== "matched" || !roomId || !roomType || !localStream) return;
+
+    let pc = pcRef.current;
+    if (!pc) {
+      pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+        ],
+      });
+      pcRef.current = pc;
+      setRemoteStream(null);
+
+      pc.onconnectionstatechange = () => {
+        console.log("[WebRTC] connectionState:", pc?.connectionState);
+      };
+      pc.oniceconnectionstatechange = () => {
+        console.log("[WebRTC] iceConnectionState:", pc?.iceConnectionState);
+      };
+      pc.onicegatheringstatechange = () => {
+        console.log("[WebRTC] iceGatheringState:", pc?.iceGatheringState);
+      };
+
+      pc.ontrack = (event) => {
+        console.log("[WebRTC] ontrack:", event.track.kind);
+        const stream = event.streams?.[0] ?? (event.track ? (() => {
+          const ms = new MediaStream();
+          ms.addTrack(event.track);
+          return ms;
+        })() : null);
+        if (stream) setRemoteStream(stream);
+      };
+
+      localStream.getTracks().forEach((track) => pc!.addTrack(track, localStream));
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          const candidate = event.candidate.toJSON?.() ?? event.candidate;
+          console.log("[WebRTC] Sending ICE candidate");
+          socket.emit("ice-candidate", { roomId, candidate });
+        }
+      };
+    }
+
+    console.log("[WebRTC] Socket connected:", socket.connected, "roomId:", roomId, "roomType:", roomType);
 
     const addIceCandidate = async (candidate: RTCIceCandidateInit) => {
       if (!pcRef.current) return;
@@ -109,11 +147,11 @@ const Room = () => {
     };
 
     const flushPendingIceCandidates = async () => {
-      const pc = pcRef.current;
-      if (!pc || pendingIceRef.current.length === 0) return;
+      const conn = pcRef.current;
+      if (!conn || pendingIceRef.current.length === 0) return;
       for (const c of pendingIceRef.current) {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(c));
+          await conn.addIceCandidate(new RTCIceCandidate(c));
         } catch (e) {
           console.error("addIceCandidate (pending) error:", e);
         }
@@ -123,33 +161,44 @@ const Room = () => {
 
     const handleIceCandidate = async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
       if (!candidate) return;
-      const pc = pcRef.current;
-      if (!pc) return;
-      if (pc.remoteDescription) {
+      const conn = pcRef.current;
+      if (!conn) return;
+      console.log("[WebRTC] Received ICE candidate");
+      if (conn.remoteDescription) {
         await addIceCandidate(candidate);
       } else {
         pendingIceRef.current.push(candidate);
       }
     };
 
-    // Answerer: receive offer from server → set remote desc → create answer → send answer
-    const handleOffer = async ({ sdp }: { sdp: string }) => {
+    const applyOffer = async (sdp: string) => {
       if (!pcRef.current || roomType !== "receive-offer") return;
       try {
+        console.log("[WebRTC] Received offer, setting remote description and sending answer");
         await pcRef.current.setRemoteDescription({ type: "offer", sdp });
         await flushPendingIceCandidates();
         const answer = await pcRef.current.createAnswer();
         await pcRef.current.setLocalDescription(answer);
         socket.emit("answer", { roomId, sdp: pcRef.current.localDescription?.sdp });
+        console.log("[WebRTC] Answer sent");
       } catch (e) {
         console.error("Answer error:", e);
       }
     };
 
-    // Offerer: receive answer from server → set remote desc to complete the connection
+    const handleOffer = async ({ sdp }: { sdp: string }) => {
+      pendingOfferRef.current = sdp;
+      if (pcRef.current && roomType === "receive-offer") {
+        const sdpToApply = pendingOfferRef.current;
+        pendingOfferRef.current = null;
+        await applyOffer(sdpToApply);
+      }
+    };
+
     const handleAnswer = async ({ sdp }: { sdp: string }) => {
       if (!pcRef.current || roomType !== "send-offer") return;
       try {
+        console.log("[WebRTC] Received answer, setting remote description");
         await pcRef.current.setRemoteDescription({ type: "answer", sdp });
         await flushPendingIceCandidates();
       } catch (e) {
@@ -161,17 +210,24 @@ const Room = () => {
     socket.on("answer", handleAnswer);
     socket.on("ice-candidate", handleIceCandidate);
 
-    // Offerer: create and send SDP offer to the other peer via server
-    if (roomType === "send-offer") {
+    if (roomType === "send-offer" && !offerSentRef.current) {
+      offerSentRef.current = true;
       (async () => {
         try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit("offer", { roomId, sdp: pc.localDescription?.sdp });
+          console.log("[WebRTC] Creating and sending offer");
+          const offer = await pc!.createOffer();
+          await pc!.setLocalDescription(offer);
+          socket.emit("offer", { roomId, sdp: pc!.localDescription?.sdp });
         } catch (e) {
           console.error("Offer error:", e);
         }
       })();
+    }
+
+    if (roomType === "receive-offer" && pendingOfferRef.current && pcRef.current) {
+      const sdpToApply = pendingOfferRef.current;
+      pendingOfferRef.current = null;
+      applyOffer(sdpToApply);
     }
 
     return () => {
